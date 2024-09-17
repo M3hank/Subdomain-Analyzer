@@ -5,9 +5,9 @@ import re
 import warnings
 import tldextract
 import subprocess
-import whois
-from datetime import datetime
 import logging
+from datetime import datetime
+import requests
 from collections import defaultdict
 from Wappalyzer import Wappalyzer, WebPage
 
@@ -576,82 +576,105 @@ def analyze_urls(urls, verbose=False):
 
     return points, list(matched_paths)
 
-def get_domain_age(subdomain, verbose=False):
+def get_first_certificate_timestamp(subdomain, verbose=False):
     """
-    Fetch the domain age in years using WHOIS data.
-    Returns the age in years as an integer. Returns None if unable to fetch.
+    Get the earliest certificate timestamp for the subdomain from crt.sh.
+    Returns the age in years and the date. Returns None, None if no certificates are found.
     """
     if verbose:
-        print(f"Fetching WHOIS data for {subdomain}...")
+        print(f"Fetching certificate data for {subdomain} from crt.sh...")
     try:
-        domain_info = whois.whois(subdomain)
-        creation_date = domain_info.creation_date
-        if isinstance(creation_date, list):
-            creation_date = creation_date[0]
-        if creation_date:
-            age = datetime.now() - creation_date
-            age_years = age.days // 365
-            if verbose:
-                print(f"Domain age for {subdomain}: {age_years} years.")
-            return age_years
+        url = f"https://crt.sh/?q={subdomain}&output=json"
+        response = requests.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            if data:
+                # Find the certificate with the earliest 'not_before' date
+                earliest_date = None
+                for cert in data:
+                    not_before_str = cert['not_before']
+                    not_before_date = datetime.strptime(not_before_str, '%Y-%m-%dT%H:%M:%S')
+                    if earliest_date is None or not_before_date < earliest_date:
+                        earliest_date = not_before_date
+                age = datetime.now() - earliest_date
+                age_years = age.days // 365
+                if verbose:
+                    print(f"First certificate date for {subdomain}: {earliest_date.date()} ({age_years} years ago)")
+                return age_years, earliest_date.date()
+            else:
+                if verbose:
+                    print(f"No certificates found for {subdomain}.")
+                return None, None
         else:
-            logging.warning(f"Creation date not found for {subdomain}.")
             if verbose:
-                print(f"Creation date not found for {subdomain}.")
-            return None
+                print(f"Error fetching data from crt.sh for {subdomain}: HTTP {response.status_code}")
+            return None, None
     except Exception as e:
-        logging.error(f"Error fetching WHOIS data for {subdomain}: {e}")
+        logging.error(f"Error fetching certificate data for {subdomain}: {e}")
         if verbose:
-            print(f"Error fetching WHOIS data for {subdomain}: {e}")
-        return None
+            print(f"Error fetching certificate data for {subdomain}: {e}")
+        return None, None
 
-def analyze_domain_age(age_years, verbose=False):
+def get_wayback_first_capture(subdomain, verbose=False):
     """
-    Assign points based on the domain age.
-    """
-    if age_years is None:
-        if verbose:
-            print("Domain age unknown. Assigning 0 points.")
-        return 0, "Unknown"
-    if age_years >= 20:
-        points = 20
-    elif 15 <= age_years < 20:
-        points = 15
-    elif 10 <= age_years < 15:
-        points = 10
-    elif 5 <= age_years < 10:
-        points = 5
-    else:
-        points = 2
-    if verbose:
-        print(f"Assigned {points} points based on domain age of {age_years} years.")
-    return points, f"{age_years} years"
-
-def analyze_technologies(wappalyzer, subdomain, verbose=False):
-    """
-    Use Wappalyzer to detect technologies used by the subdomain.
-    Assign points based on the technologies detected.
+    Get the earliest capture date of the subdomain from the Wayback Machine.
+    Returns the age in years and the date. Returns None, None if no captures are found.
     """
     if verbose:
-        print(f"Detecting technologies for {subdomain} using Wappalyzer...")
-    tech_points = 0
-    technologies = set()
+        print(f"Fetching Wayback Machine data for {subdomain}...")
     try:
-        webpage = WebPage.new_from_url(f"http://{subdomain}")
-        detected_technologies = wappalyzer.analyze_with_versions_and_categories(webpage)
-        for tech, info in detected_technologies.items():
-            technologies.add(tech)
-            points = TECHNOLOGY_POINTS.get(tech.lower(), 2)  # Default to 2 points if not specified
-            tech_points += points
+        url = f"http://web.archive.org/cdx/search/cdx?url={subdomain}&output=json&limit=1&filter=statuscode:200&from=1996"
+        response = requests.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            if len(data) > 1:
+                # The first row is the header
+                first_capture = data[1]
+                timestamp = first_capture[1]  # The timestamp is the second element
+                capture_date = datetime.strptime(timestamp, '%Y%m%d%H%M%S')
+                age = datetime.now() - capture_date
+                age_years = age.days // 365
+                if verbose:
+                    print(f"First archived date for {subdomain}: {capture_date.date()} ({age_years} years ago)")
+                return age_years, capture_date.date()
+            else:
+                if verbose:
+                    print(f"No archived data found for {subdomain}.")
+                return None, None
+        else:
             if verbose:
-                print(f"Detected technology '{tech}'. +{points} points")
+                print(f"Error fetching data from Wayback Machine for {subdomain}: HTTP {response.status_code}")
+            return None, None
     except Exception as e:
-        logging.error(f"Error detecting technologies for {subdomain}: {e}")
+        logging.error(f"Error fetching Wayback Machine data for {subdomain}: {e}")
         if verbose:
-            print(f"Error detecting technologies for {subdomain}: {e}")
-    return tech_points, list(technologies)
+            print(f"Error fetching Wayback Machine data for {subdomain}: {e}")
+        return None, None
 
-def analyze_subdomain(subdomain, wappalyzer, verbose=False):
+def get_subdomain_age(subdomain, verbose=False):
+    """
+    Estimate the subdomain age using both crt.sh and the Wayback Machine.
+    Returns the age in years, the date, and the method used.
+    """
+    age_crt, date_crt = get_first_certificate_timestamp(subdomain, verbose=verbose)
+    age_wayback, date_wayback = get_wayback_first_capture(subdomain, verbose=verbose)
+    
+    ages_dates_methods = []
+    
+    if age_crt is not None:
+        ages_dates_methods.append((age_crt, date_crt, 'crt.sh'))
+    
+    if age_wayback is not None:
+        ages_dates_methods.append((age_wayback, date_wayback, 'Wayback Machine'))
+    
+    if ages_dates_methods:
+        # Use the maximum age (oldest date)
+        age_years, date_used, method_used = max(ages_dates_methods, key=lambda x: x[0])
+        return age_years, date_used, method_used
+    else:
+        return None, None, None
+
+def analyze_subdomain(subdomain, verbose=False):
     """
     Analyze a single subdomain and return the analysis result.
     """
@@ -662,11 +685,20 @@ def analyze_subdomain(subdomain, wappalyzer, verbose=False):
         'matched_keywords': [],
         'matched_paths': [],
         'technologies': [],
-        'domain_age': ""
+        'subdomain_age': ""
     }
 
     if verbose:
         print(f"\n--- Analyzing {subdomain} ---")
+
+    # Initialize Wappalyzer inside the thread for thread safety
+    try:
+        wappalyzer = Wappalyzer.latest()
+    except Exception as e:
+        logging.error(f"Error initializing Wappalyzer: {e}")
+        if verbose:
+            print(f"Error initializing Wappalyzer: {e}")
+        return result
 
     # Analyze subdomain name
     subdomain_points, matched_keywords = analyze_subdomain_name(subdomain)
@@ -694,15 +726,52 @@ def analyze_subdomain(subdomain, wappalyzer, verbose=False):
     total_points += tech_points
     result['technologies'] = technologies
 
-    # Fetch and analyze domain age using WHOIS
-    age_years = get_domain_age(subdomain, verbose=verbose)
-    age_points, age_display = analyze_domain_age(age_years, verbose=verbose)
-    total_points += age_points
-    result['domain_age'] = age_display
+    # Fetch and analyze subdomain age using both methods
+    age_years, date_used, method_used = get_subdomain_age(subdomain, verbose=verbose)
+    if age_years is not None:
+        # Assign points based on the age
+        if age_years >= 10:
+            age_points = 10
+        elif 5 <= age_years < 10:
+            age_points = 5
+        else:
+            age_points = 2
+        total_points += age_points
+        result['subdomain_age'] = f"{age_years} years (since {date_used}, via {method_used})"
+        if verbose:
+            print(f"Assigned {age_points} points based on subdomain age of {age_years} years.")
+    else:
+        if verbose:
+            print("Subdomain age unknown. Assigning 0 points.")
+        result['subdomain_age'] = "Unknown"
 
     result['total_points'] = total_points
 
     return result
+
+def analyze_technologies(wappalyzer, subdomain, verbose=False):
+    """
+    Use Wappalyzer to detect technologies used by the subdomain.
+    Assign points based on the technologies detected.
+    """
+    if verbose:
+        print(f"Detecting technologies for {subdomain} using Wappalyzer...")
+    tech_points = 0
+    technologies = set()
+    try:
+        webpage = WebPage.new_from_url(f"http://{subdomain}")
+        detected_technologies = wappalyzer.analyze_with_versions_and_categories(webpage)
+        for tech, info in detected_technologies.items():
+            technologies.add(tech)
+            points = TECHNOLOGY_POINTS.get(tech.lower(), 2)  # Default to 2 points if not specified
+            tech_points += points
+            if verbose:
+                print(f"Detected technology '{tech}'. +{points} points")
+    except Exception as e:
+        logging.error(f"Error detecting technologies for {subdomain}: {e}")
+        if verbose:
+            print(f"Error detecting technologies for {subdomain}: {e}")
+    return tech_points, list(technologies)
 
 def main():
     args = parse_arguments()
@@ -710,17 +779,9 @@ def main():
     subdomains = load_subdomains(args.input)
     results = []
 
-    # Initialize Wappalyzer once
-    try:
-        wappalyzer = Wappalyzer.latest()
-    except Exception as e:
-        logging.error(f"Error initializing Wappalyzer: {e}")
-        print(f"Error initializing Wappalyzer: {e}")
-        exit(1)
-
     total_subdomains = len(subdomains)
     with ThreadPoolExecutor(max_workers=10) as executor:
-        future_to_subdomain = {executor.submit(analyze_subdomain, subdomain, wappalyzer, args.verbose): subdomain for subdomain in subdomains}
+        future_to_subdomain = {executor.submit(analyze_subdomain, subdomain, args.verbose): subdomain for subdomain in subdomains}
         for idx, future in enumerate(as_completed(future_to_subdomain), start=1):
             subdomain = future_to_subdomain[future]
             try:
@@ -745,7 +806,7 @@ def main():
                 report_file.write(f"Interesting Keywords Detected: {', '.join(res['matched_keywords']) if res['matched_keywords'] else 'None'}\n")
                 report_file.write(f"Matched Paths: {', '.join(res['matched_paths']) if res['matched_paths'] else 'None'}\n")
                 report_file.write(f"Technologies Detected: {', '.join(res['technologies']) if res['technologies'] else 'None'}\n")
-                report_file.write(f"Domain Age: {res['domain_age']}\n")
+                report_file.write(f"Subdomain Age: {res['subdomain_age']}\n")
                 report_file.write('-' * 60 + '\n')
         print(f"\nAnalysis complete. Report saved to {args.output}")
         logging.info(f"Analysis complete. Report saved to {args.output}")
