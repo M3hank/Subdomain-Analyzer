@@ -1,0 +1,6 @@
+# Runtime dependencies
+requests>=2.25
+tldextract>=3.1
+
+# Optional: richer technology fingerprinting
+# python-Wappalyzer>=1.0.0
